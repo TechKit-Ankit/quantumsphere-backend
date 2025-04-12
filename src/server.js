@@ -69,7 +69,7 @@ const timeEntryRoutes = require('./routes/timeEntryRoutes');
 
 // Public routes
 app.use('/api/auth', authRoutes);
-app.use('/companies', companyRoutes); // Company registration is public
+app.use('/api/companies', companyRoutes);
 
 // Protected routes
 app.use('/api/employees', authenticateToken, employeeRoutes);
