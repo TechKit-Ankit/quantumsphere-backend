@@ -18,23 +18,15 @@ app.use(cors({
 app.use(express.json());
 app.use(morgan('dev'));
 
-// Root route for API health check
-app.get('/', (req, res) => {
-    res.json({
-        status: 'ok',
-        message: 'QuantumSphere API is running'
-    });
+// Request logging middleware
+app.use((req, res, next) => {
+    console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+    next();
 });
 
 // Health check endpoint (no auth required)
 app.get('/api/health', (req, res) => {
     res.json({ status: 'ok' });
-});
-
-// Request logging middleware
-app.use((req, res, next) => {
-    console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
-    next();
 });
 
 // Connect to MongoDB with improved error handling
@@ -73,7 +65,7 @@ const timeEntryRoutes = require('./routes/timeEntryRoutes');
 
 // Public routes
 app.use('/api/auth', authRoutes);
-app.use('/api/companies/public', companyRoutes); // Company registration is public
+app.use('/companies', companyRoutes); // Company registration is public
 
 // Protected routes
 app.use('/api/employees', authenticateToken, employeeRoutes);
