@@ -27,15 +27,38 @@ const validate = (req, res, next) => {
     next();
 };
 
-// Get all employees (admin only)
+// Get all employees (admin only, but filtered by their company)
 router.get('/', authenticateToken, isAdmin, async (req, res) => {
     try {
-        const employees = await Employee.find()
-            .select('-password')
+        // 1. Get the Admin's User ID
+        const adminUserId = req.user.userId;
+
+        // 2. Find the Admin's User or Employee record to get their company
+        // Prefer User model if it reliably stores the company link
+        const adminUser = await User.findById(adminUserId).lean(); // Use lean for efficiency if just reading
+
+        if (!adminUser || !adminUser.company) {
+            console.error(`Admin user ${adminUserId} or their company not found.`);
+            // Decide on appropriate response: maybe fetch Employee as fallback, or return error
+            // Fallback attempt (if User doesn't have company, maybe Employee does):
+            const adminEmployee = await Employee.findOne({ userId: adminUserId }).lean();
+            if (!adminEmployee || !adminEmployee.company) {
+                return errorResponse(res, 'Could not determine admin\'s company.', 400);
+            }
+            adminUser.company = adminEmployee.company; // Use company from Employee record
+        }
+
+        const adminCompanyId = adminUser.company;
+
+        // 3. Find employees ONLY for that company
+        const employees = await Employee.find({ company: adminCompanyId })
+            .select('-password') // Exclude sensitive fields if User model has password
             .populate('department', 'name')
             .populate('reportingManager', 'firstName lastName email');
-        return successResponse(res, employees, 'Employees retrieved successfully');
+
+        return successResponse(res, employees, 'Employees retrieved successfully for company');
     } catch (error) {
+        console.error("Error retrieving employees for admin's company:", error);
         return errorResponse(res, 'Error retrieving employees');
     }
 });
