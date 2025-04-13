@@ -232,18 +232,27 @@ router.put('/:id', leaveValidation, validate, async (req, res) => {
             return notFoundResponse(res, 'Leave request not found');
         }
 
-        // Check if we're changing status from pending to approved
-        const isNewlyApproved = leave.status !== 'approved' && updateData.status === 'approved';
-
-        // Check if we're changing status from approved to rejected/canceled
-        const isApprovalRevoked = leave.status === 'approved' &&
-            (updateData.status === 'rejected' || updateData.status === 'canceled');
+        // Store the original status before any updates
+        const originalStatus = leave.status;
 
         // Update the fields
         Object.assign(leave, updateData);
 
+        // --- If manager just approved, also set main status to approved ---
+        if (updateData.managerApproval?.status === 'approved') {
+            console.log(`Manager approved leave ${id}, setting main status to approved.`);
+            leave.status = 'approved';
+        }
+        // --- End NEW ---
+
         // Save the updated leave
         await leave.save();
+
+        // --- Check approval status AFTER potential update by manager ---
+        const isNewlyApproved = originalStatus !== 'approved' && leave.status === 'approved';
+        const isApprovalRevoked = originalStatus === 'approved' &&
+            (leave.status === 'rejected' || leave.status === 'canceled');
+        // --- End Check ---
 
         // If the leave was just approved, update the employee's leave balance
         if (isNewlyApproved) {
