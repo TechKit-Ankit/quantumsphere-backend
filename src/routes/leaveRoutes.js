@@ -4,7 +4,7 @@ const { body, validationResult } = require('express-validator');
 const Leave = require('../models/Leave');
 const Employee = require('../models/Employee');
 const { authenticateToken } = require('../middleware/auth');
-const { successResponse, errorResponse, notFoundResponse, validationErrorResponse } = require('../utils/apiResponse');
+const { successResponse, errorResponse, notFoundResponse, validationErrorResponse, unauthorizedResponse } = require('../utils/apiResponse');
 
 // Validation middleware
 const leaveValidation = [
@@ -157,34 +157,44 @@ router.patch('/:id/status', leaveStatusValidation, validate, async (req, res) =>
             return notFoundResponse(res, 'Leave request not found');
         }
 
-        leave.status = status;
-        leave.statusUpdateDate = new Date();
-        leave.statusComments = comments;
-
-        // Add manager approval details if approved
-        if (status === 'approved') {
-            const manager = await Employee.findOne({ userId: req.user.userId });
-            if (manager) {
-                leave.managerApproval = {
-                    approvedBy: manager._id,
-                    approvedAt: new Date()
-                };
-            }
+        // Ensure only admin can use this endpoint
+        if (req.user.role !== 'admin') {
+            return unauthorizedResponse(res, 'Admin access required to update leave status');
         }
+
+        // Prevent updating already processed leaves if desired (optional check)
+        // if (leave.status !== 'pending') {
+        //    return errorResponse(res, 'Leave request already processed', 400);
+        // }
+
+        const originalStatus = leave.status;
+
+        // Update only the main status and related fields
+        leave.status = status;
+        // Optionally add a field to track who updated the status if needed
+        // leave.statusUpdatedBy = req.user.userId; 
+        leave.statusUpdateDate = new Date(); // Consider a dedicated field if needed
+        leave.statusComments = comments; // Consider a dedicated field if needed
+
+        // DO NOT MODIFY managerApproval here - this endpoint is for overall status
 
         await leave.save();
 
-        // Update employee leave balance if approved
-        if (status === 'approved') {
+        // Update employee leave balance based on the main status change
+        const isNewlyApproved = originalStatus !== 'approved' && status === 'approved';
+        const isApprovalRevoked = originalStatus === 'approved' && (status === 'rejected' || status === 'canceled');
+
+        if (isNewlyApproved) {
             await updateEmployeeLeaveBalance(leave);
-        } else if (leave.status !== status && leave.status === 'approved') {
-            // If status changed from approved, restore balance
+        } else if (isApprovalRevoked) {
             await restoreLeaveBalance(leave);
         }
 
         return successResponse(res, leave, 'Leave status updated successfully');
     } catch (error) {
-        return errorResponse(res, 'Error updating leave status');
+        // Log the detailed error
+        console.error(`Error updating leave status for ${req.params.id}:`, error);
+        return errorResponse(res, 'Error updating leave status', 500, error.message);
     }
 });
 
