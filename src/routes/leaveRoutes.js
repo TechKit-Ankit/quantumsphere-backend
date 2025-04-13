@@ -1,10 +1,10 @@
 const express = require('express');
 const router = express.Router();
-const { body } = require('express-validator');
-const leaveController = require('../controllers/leaveController');
+const { body, validationResult } = require('express-validator');
 const Leave = require('../models/Leave');
 const Employee = require('../models/Employee');
 const { authenticateToken } = require('../middleware/auth');
+const { successResponse, errorResponse, notFoundResponse, validationErrorResponse } = require('../utils/apiResponse');
 
 // Validation middleware
 const leaveValidation = [
@@ -16,14 +16,23 @@ const leaveValidation = [
 ];
 
 const leaveStatusValidation = [
-    body('status').isIn(['approved', 'rejected']).withMessage('Invalid status'),
+    body('status').isIn(['approved', 'rejected', 'canceled']).withMessage('Invalid status'),
     body('comments').optional().trim()
 ];
 
-// Use JWT auth instead of Clerk
+// Validation result middleware
+const validate = (req, res, next) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+        return validationErrorResponse(res, 'Validation failed', errors.array());
+    }
+    next();
+};
+
+// Use JWT auth
 router.use(authenticateToken);
 
-// Routes
+// Get all leaves (filtered by query params)
 router.get('/', async (req, res) => {
     try {
         const query = {};
@@ -49,7 +58,7 @@ router.get('/', async (req, res) => {
             const employee = await Employee.findOne({ userId: req.user.userId });
 
             if (!employee) {
-                return res.status(404).json({ message: 'Employee not found' });
+                return notFoundResponse(res, 'Employee not found');
             }
 
             // If no specific query was provided and the endpoint is for 'team-leaves',
@@ -62,7 +71,7 @@ router.get('/', async (req, res) => {
                     query.employee = { $in: reportingEmployeeIds };
                 } else {
                     // No reporting employees, return empty array
-                    return res.json([]);
+                    return successResponse(res, [], 'No reporting employees found');
                 }
             } else if (!query.employee) {
                 // If not viewing team leaves and no specific employee filter, show only current user's leaves
@@ -70,34 +79,34 @@ router.get('/', async (req, res) => {
             }
         }
 
-        console.log('Leaves query:', query);
-
         const leaves = await Leave.find(query)
             .populate('employee', 'firstName lastName')
             .populate('managerApproval.approvedBy', 'firstName lastName')
             .sort({ createdAt: -1 });
 
-        res.json(leaves);
+        return successResponse(res, leaves, 'Leaves retrieved successfully');
     } catch (error) {
-        console.error('Error fetching leaves:', error);
-        res.status(500).json({ message: 'Error fetching leaves' });
+        return errorResponse(res, 'Error fetching leaves');
     }
 });
 
+// Get leaves for a specific employee
 router.get('/employee/:employeeId', async (req, res) => {
     try {
         const leaves = await Leave.find({ employee: req.params.employeeId })
+            .populate('employee', 'firstName lastName')
+            .populate('managerApproval.approvedBy', 'firstName lastName')
             .sort({ createdAt: -1 });
-        res.json(leaves);
+
+        return successResponse(res, leaves, 'Employee leaves retrieved successfully');
     } catch (error) {
-        console.error('Error fetching employee leaves:', error);
-        res.status(500).json({ message: 'Error fetching employee leaves' });
+        return errorResponse(res, 'Error fetching employee leaves');
     }
 });
 
-router.post('/', async (req, res) => {
+// Create a new leave request
+router.post('/', leaveValidation, validate, async (req, res) => {
     try {
-        console.log('Creating leave request:', req.body);
         // Check if employee is directly specified in the request
         if (req.body.employee) {
             const leave = new Leave({
@@ -106,19 +115,19 @@ router.post('/', async (req, res) => {
                 endDate: req.body.endDate,
                 type: req.body.type,
                 reason: req.body.reason,
+                comments: req.body.comments,
                 status: 'pending'
             });
 
             await leave.save();
-            return res.status(201).json(leave);
+            return successResponse(res, leave, 'Leave request created successfully', 201);
         }
 
         // Otherwise, find the employee based on the logged-in user
         const employee = await Employee.findOne({ userId: req.user.userId });
 
         if (!employee) {
-            console.error('Employee not found for user:', req.user.userId);
-            return res.status(404).json({ message: 'Employee not found' });
+            return notFoundResponse(res, 'Employee not found');
         }
 
         const leave = new Leave({
@@ -127,72 +136,81 @@ router.post('/', async (req, res) => {
             endDate: req.body.endDate,
             type: req.body.type,
             reason: req.body.reason,
+            comments: req.body.comments,
             status: 'pending'
         });
 
         await leave.save();
-        res.status(201).json(leave);
+        return successResponse(res, leave, 'Leave request created successfully', 201);
     } catch (error) {
-        console.error('Error creating leave request:', error);
-        res.status(500).json({ message: 'Error creating leave request' });
+        return errorResponse(res, 'Error creating leave request');
     }
 });
 
-router.patch('/:id/status', async (req, res) => {
+// Update leave status
+router.patch('/:id/status', leaveStatusValidation, validate, async (req, res) => {
     try {
-        const { status } = req.body;
+        const { status, comments } = req.body;
         const leave = await Leave.findById(req.params.id);
 
         if (!leave) {
-            return res.status(404).json({ message: 'Leave request not found' });
+            return notFoundResponse(res, 'Leave request not found');
         }
 
         leave.status = status;
+        leave.statusUpdateDate = new Date();
+        leave.statusComments = comments;
+
+        // Add manager approval details if approved
+        if (status === 'approved') {
+            const manager = await Employee.findOne({ userId: req.user.userId });
+            if (manager) {
+                leave.managerApproval = {
+                    approvedBy: manager._id,
+                    approvedAt: new Date()
+                };
+            }
+        }
+
         await leave.save();
-        res.json(leave);
+
+        // Update employee leave balance if approved
+        if (status === 'approved') {
+            await updateEmployeeLeaveBalance(leave);
+        } else if (leave.status !== status && leave.status === 'approved') {
+            // If status changed from approved, restore balance
+            await restoreLeaveBalance(leave);
+        }
+
+        return successResponse(res, leave, 'Leave status updated successfully');
     } catch (error) {
-        console.error('Error updating leave status:', error);
-        res.status(500).json({ message: 'Error updating leave status' });
+        return errorResponse(res, 'Error updating leave status');
     }
 });
 
+// Delete leave request
 router.delete('/:id', async (req, res) => {
     try {
         const leave = await Leave.findById(req.params.id);
 
         if (!leave) {
-            return res.status(404).json({ message: 'Leave request not found' });
+            return notFoundResponse(res, 'Leave request not found');
         }
 
         // Check if the leave was approved - need to restore leave balance
         if (leave.status === 'approved') {
-            const employee = await Employee.findById(leave.employee);
-            if (employee && employee.leaveBalance) {
-                // Calculate number of days
-                const startDate = new Date(leave.startDate);
-                const endDate = new Date(leave.endDate);
-                const diffTime = Math.abs(endDate - startDate);
-                const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1; // +1 to include both start and end dates
-
-                // Restore leave balance
-                employee.leaveBalance.used = Math.max(0, employee.leaveBalance.used - diffDays);
-                employee.leaveBalance.remaining = employee.leaveBalance.total - employee.leaveBalance.used;
-
-                await employee.save();
-                console.log(`Restored leave balance for employee ${employee._id}, returned ${diffDays} days due to leave deletion`);
-            }
+            await restoreLeaveBalance(leave);
         }
 
         await Leave.deleteOne({ _id: req.params.id });
-        res.json({ message: 'Leave request deleted successfully' });
+        return successResponse(res, null, 'Leave request deleted successfully');
     } catch (error) {
-        console.error('Error deleting leave request:', error);
-        res.status(500).json({ message: 'Error deleting leave request' });
+        return errorResponse(res, 'Error deleting leave request');
     }
 });
 
-// Add a PUT route for updating leaves
-router.put('/:id', async (req, res) => {
+// Update leave request
+router.put('/:id', leaveValidation, validate, async (req, res) => {
     try {
         const { id } = req.params;
         const updateData = req.body;
@@ -201,7 +219,7 @@ router.put('/:id', async (req, res) => {
         const leave = await Leave.findById(id);
 
         if (!leave) {
-            return res.status(404).json({ message: 'Leave request not found' });
+            return notFoundResponse(res, 'Leave request not found');
         }
 
         // Check if we're changing status from pending to approved
@@ -211,9 +229,6 @@ router.put('/:id', async (req, res) => {
         const isApprovalRevoked = leave.status === 'approved' &&
             (updateData.status === 'rejected' || updateData.status === 'canceled');
 
-        // Store old status for reference
-        const oldStatus = leave.status;
-
         // Update the fields
         Object.assign(leave, updateData);
 
@@ -222,128 +237,63 @@ router.put('/:id', async (req, res) => {
 
         // If the leave was just approved, update the employee's leave balance
         if (isNewlyApproved) {
-            const employee = await Employee.findById(leave.employee);
-            if (employee && employee.leaveBalance) {
-                // Calculate number of days
-                const startDate = new Date(leave.startDate);
-                const endDate = new Date(leave.endDate);
-                const diffTime = Math.abs(endDate - startDate);
-                const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1; // +1 to include both start and end dates
-
-                // Update leave balance
-                employee.leaveBalance.used += diffDays;
-                employee.leaveBalance.remaining = employee.leaveBalance.total - employee.leaveBalance.used;
-
-                await employee.save();
-                console.log(`Updated leave balance for employee ${employee._id}, used ${diffDays} days`);
-            }
+            await updateEmployeeLeaveBalance(leave);
         }
         // If approval was revoked, restore the leave balance
         else if (isApprovalRevoked) {
-            const employee = await Employee.findById(leave.employee);
-            if (employee && employee.leaveBalance) {
-                // Calculate number of days
-                const startDate = new Date(leave.startDate);
-                const endDate = new Date(leave.endDate);
-                const diffTime = Math.abs(endDate - startDate);
-                const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1; // +1 to include both start and end dates
-
-                // Restore leave balance
-                employee.leaveBalance.used = Math.max(0, employee.leaveBalance.used - diffDays);
-                employee.leaveBalance.remaining = employee.leaveBalance.total - employee.leaveBalance.used;
-
-                await employee.save();
-                console.log(`Restored leave balance for employee ${employee._id}, returned ${diffDays} days`);
-            }
+            await restoreLeaveBalance(leave);
         }
 
-        res.json(leave);
+        return successResponse(res, leave, 'Leave request updated successfully');
     } catch (error) {
-        console.error('Error updating leave:', error);
-        res.status(500).json({ message: 'Error updating leave request' });
+        return errorResponse(res, 'Error updating leave request');
     }
 });
 
-// Add a route for manager approval
-router.put('/:id/manager-approval', async (req, res) => {
+// Helper function to update employee leave balance
+async function updateEmployeeLeaveBalance(leave) {
     try {
-        const { id } = req.params;
-        const { status, comments } = req.body;
-
-        if (!['approved', 'rejected'].includes(status)) {
-            return res.status(400).json({ message: 'Invalid status value' });
-        }
-
-        // Find the leave request
-        const leave = await Leave.findById(id);
-        if (!leave) {
-            return res.status(404).json({ message: 'Leave request not found' });
-        }
-
-        // Find the current employee (manager)
-        const manager = await Employee.findOne({ userId: req.user.userId });
-        if (!manager) {
-            return res.status(404).json({ message: 'Manager not found' });
-        }
-
-        // Find the employee who requested the leave
         const employee = await Employee.findById(leave.employee);
-        if (!employee) {
-            return res.status(404).json({ message: 'Employee not found' });
-        }
+        if (!employee || !employee.leaveBalance) return;
 
-        // Check if the current user is the reporting manager of the employee
-        // Admin and HR users can approve any leave
-        // If employee doesn't have a reporting manager, admin/HR will handle approvals
-        const isManagerOfEmployee = employee.reportingManager &&
-            employee.reportingManager.toString() === manager._id.toString();
-        const isAdminOrHR = req.user.role === 'admin' || req.user.role === 'hr';
+        // Calculate number of days
+        const startDate = new Date(leave.startDate);
+        const endDate = new Date(leave.endDate);
+        const diffTime = Math.abs(endDate - startDate);
+        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1; // +1 to include both start and end dates
 
-        // If employee has no reporting manager, only admin can approve
-        const employeeHasNoManager = !employee.reportingManager;
+        // Update leave balance
+        employee.leaveBalance.used += diffDays;
+        employee.leaveBalance.remaining = employee.leaveBalance.total - employee.leaveBalance.used;
 
-        if (!isManagerOfEmployee && !isAdminOrHR && !employeeHasNoManager) {
-            return res.status(403).json({ message: 'You are not authorized to approve/reject this leave request' });
-        }
-
-        // Update the manager approval status
-        leave.managerApproval = {
-            status,
-            approvedBy: manager._id,
-            approvedAt: new Date(),
-            comments: comments || ''
-        };
-
-        // If manager approved, also update the main status (for backwards compatibility)
-        if (status === 'approved') {
-            leave.status = 'approved';
-
-            // Update leave balance if approved
-            if (employee && employee.leaveBalance) {
-                // Calculate number of days
-                const startDate = new Date(leave.startDate);
-                const endDate = new Date(leave.endDate);
-                const diffTime = Math.abs(endDate - startDate);
-                const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1; // +1 to include both start and end dates
-
-                // Update leave balance
-                employee.leaveBalance.used += diffDays;
-                employee.leaveBalance.remaining = employee.leaveBalance.total - employee.leaveBalance.used;
-
-                await employee.save();
-                console.log(`Updated leave balance for employee ${employee._id}, used ${diffDays} days`);
-            }
-        } else if (status === 'rejected') {
-            leave.status = 'rejected';
-        }
-
-        await leave.save();
-
-        res.json(leave);
+        await employee.save();
     } catch (error) {
-        console.error('Error updating manager approval:', error);
-        res.status(500).json({ message: 'Error updating manager approval' });
+        // Log error but allow process to continue
+        console.error(`Error updating leave balance for employee ${leave.employee}: ${error.message}`);
     }
-});
+}
+
+// Helper function to restore employee leave balance
+async function restoreLeaveBalance(leave) {
+    try {
+        const employee = await Employee.findById(leave.employee);
+        if (!employee || !employee.leaveBalance) return;
+
+        // Calculate number of days
+        const startDate = new Date(leave.startDate);
+        const endDate = new Date(leave.endDate);
+        const diffTime = Math.abs(endDate - startDate);
+        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1; // +1 to include both start and end dates
+
+        // Restore leave balance
+        employee.leaveBalance.used = Math.max(0, employee.leaveBalance.used - diffDays);
+        employee.leaveBalance.remaining = employee.leaveBalance.total - employee.leaveBalance.used;
+
+        await employee.save();
+    } catch (error) {
+        // Log error but allow process to continue
+        console.error(`Error restoring leave balance for employee ${leave.employee}: ${error.message}`);
+    }
+}
 
 module.exports = router;

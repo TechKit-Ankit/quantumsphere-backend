@@ -1,12 +1,12 @@
 const express = require('express');
 const router = express.Router();
-const { body } = require('express-validator');
-const employeeController = require('../controllers/employeeController');
-const { authenticateToken, requireAdmin } = require('../middleware/auth');
+const { body, validationResult } = require('express-validator');
+const { authenticateToken, isAdmin } = require('../middleware/auth');
 const Employee = require('../models/Employee');
 const User = require('../models/User');
 const bcrypt = require('bcryptjs');
 const mongoose = require('mongoose');
+const { successResponse, errorResponse, notFoundResponse, validationErrorResponse, unauthorizedResponse } = require('../utils/apiResponse');
 
 // Validation middleware
 const employeeValidation = [
@@ -18,174 +18,238 @@ const employeeValidation = [
     body('phoneNumber').optional().isMobilePhone().withMessage('Please enter a valid phone number')
 ];
 
-// Routes
-router.get('/', authenticateToken, employeeController.getAllEmployees);
-router.get('/me', authenticateToken, employeeController.getCurrentEmployee);
+// Validation result middleware
+const validate = (req, res, next) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+        return validationErrorResponse(res, 'Validation failed', errors.array());
+    }
+    next();
+};
 
-// Add a new endpoint to get all employees reporting to the current user
-router.get('/reporting-to-me', authenticateToken, async (req, res) => {
+// Get all employees (admin only)
+router.get('/', authenticateToken, isAdmin, async (req, res) => {
     try {
-        // If user is admin, they can see all employees so we'll return an empty array
-        // since they don't need a special "reporting to me" view
-        if (req.user.role === 'admin' || req.user.role === 'hr') {
-            return res.json([]);
-        }
-
-        // Find the current employee
-        const manager = await Employee.findOne({ userId: req.user.userId });
-
-        if (!manager) {
-            return res.status(404).json({ message: 'Manager not found' });
-        }
-
-        // Find all employees reporting to this manager
-        const employees = await Employee.find({ reportingManager: manager._id })
+        const employees = await Employee.find()
+            .select('-password')
             .populate('department', 'name')
-            .exec();
-
-        res.json(employees);
+            .populate('reportingManager', 'firstName lastName email');
+        return successResponse(res, employees, 'Employees retrieved successfully');
     } catch (error) {
-        console.error('Error fetching reporting employees:', error);
-        res.status(500).json({ message: 'Server error' });
+        return errorResponse(res, 'Error retrieving employees');
     }
 });
 
-router.get('/:id', authenticateToken, employeeController.getEmployeeById);
+// Get current employee profile
+router.get('/me', authenticateToken, async (req, res) => {
+    try {
+        const employee = await Employee.findOne({ userId: req.user.userId })
+            .select('-password')
+            .populate('department', 'name')
+            .populate('reportingManager', 'firstName lastName email');
 
-// Create employee with user account
-router.post('/', authenticateToken, requireAdmin, employeeValidation, async (req, res) => {
-    // Start a session for transaction
+        if (!employee) {
+            return notFoundResponse(res, 'Employee profile not found');
+        }
+        return successResponse(res, employee, 'Profile retrieved successfully');
+    } catch (error) {
+        return errorResponse(res, 'Error retrieving profile');
+    }
+});
+
+// Get employees reporting to current user
+router.get('/reporting-to-me', authenticateToken, async (req, res) => {
+    try {
+        if (req.user.role === 'admin') {
+            const employees = await Employee.find()
+                .select('-password')
+                .populate('department', 'name')
+                .populate('reportingManager', 'firstName lastName email');
+            return successResponse(res, employees, 'All employees retrieved for admin');
+        }
+
+        const manager = await Employee.findOne({ userId: req.user.userId });
+        if (!manager) {
+            return notFoundResponse(res, 'Manager profile not found');
+        }
+
+        const employees = await Employee.find({ reportingManager: manager._id })
+            .select('-password')
+            .populate('department', 'name')
+            .populate('reportingManager', 'firstName lastName email');
+
+        return successResponse(res, employees, 'Reporting employees retrieved successfully');
+    } catch (error) {
+        return errorResponse(res, 'Error retrieving reporting employees');
+    }
+});
+
+// Get employee by ID
+router.get('/:id', authenticateToken, async (req, res) => {
+    try {
+        const employee = await Employee.findById(req.params.id)
+            .select('-password')
+            .populate('department', 'name')
+            .populate('reportingManager', 'firstName lastName email');
+
+        if (!employee) {
+            return notFoundResponse(res, 'Employee not found');
+        }
+        return successResponse(res, employee, 'Employee retrieved successfully');
+    } catch (error) {
+        if (error instanceof mongoose.Error.CastError) {
+            return notFoundResponse(res, 'Invalid employee ID');
+        }
+        return errorResponse(res, 'Error retrieving employee');
+    }
+});
+
+// Create employee
+router.post('/', authenticateToken, isAdmin, employeeValidation, validate, async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
 
     try {
         const { email, userId } = req.body;
 
-        // Get admin's company from token
         const adminUser = await User.findById(req.user.userId).session(session);
         if (!adminUser?.company) {
             await session.abortTransaction();
-            return res.status(400).json({ message: 'Admin user company not found' });
+            return errorResponse(res, 'Admin user company not found', 400);
         }
 
-        // Check if email already exists
         const existingEmployee = await Employee.findOne({ email }).session(session);
         if (existingEmployee) {
             await session.abortTransaction();
-            return res.status(400).json({ message: 'Employee with this email already exists' });
+            return errorResponse(res, 'Employee with this email already exists', 400);
         }
 
-        // Create employee record with company ID from admin
         const employee = new Employee({
             ...req.body,
-            userId: userId, // Use the userId from the already created user
+            userId,
             enrollmentStatus: 'completed',
             enrolledAt: new Date(),
             company: adminUser.company
         });
 
-        // Set reportingManager to null for admin role
         if (employee.role === 'admin') {
             employee.reportingManager = null;
         } else if (!employee.reportingManager) {
-            // For non-admin roles, ensure they have a reporting manager
-            return res.status(400).json({ message: 'Reporting manager is required for non-admin employees' });
+            await session.abortTransaction();
+            return errorResponse(res, 'Reporting manager is required for non-admin employees', 400);
         }
 
-        // Save employee
         await employee.save({ session });
-
-        // Update user with employeeId
-        await User.findByIdAndUpdate(
-            userId,
-            { employeeId: employee._id },
-            { session }
-        );
-
-        // Commit the transaction
+        await User.findByIdAndUpdate(userId, { employeeId: employee._id }, { session });
         await session.commitTransaction();
 
-        console.log('Employee created successfully:', employee);
+        const populatedEmployee = await Employee.findById(employee._id)
+            .populate('department', 'name')
+            .populate('reportingManager', 'firstName lastName email');
 
-        res.status(201).json({
-            message: 'Employee enrolled successfully',
-            employee: employee.toObject()
-        });
+        return successResponse(res, populatedEmployee, 'Employee enrolled successfully', 201);
     } catch (error) {
-        // If anything fails, abort the transaction
         await session.abortTransaction();
-        console.error('Error creating employee:', error);
-        res.status(500).json({ message: error.message });
+        return errorResponse(res, 'Error creating employee');
     } finally {
-        // End the session
         session.endSession();
     }
 });
 
-router.put('/:id', authenticateToken, requireAdmin, employeeValidation, async (req, res) => {
+// Update employee
+router.put('/:id', authenticateToken, employeeValidation, validate, async (req, res) => {
     try {
-        const { id } = req.params;
-        const updateData = req.body;
-
-        // If updating role to admin, remove reporting manager
-        if (updateData.role === 'admin') {
-            updateData.reportingManager = null;
-        }
-
-        // For non-admin roles, ensure they have a reporting manager if one is provided
-        if (updateData.role !== 'admin' && updateData.reportingManager) {
-            // Validate that the reporting manager exists
-            const manager = await Employee.findById(updateData.reportingManager);
-            if (!manager) {
-                return res.status(400).json({ message: 'Reporting manager not found' });
-            }
+        if (req.user.role !== 'admin' && req.user.userId !== req.params.id) {
+            return unauthorizedResponse(res, 'Unauthorized to update this profile');
         }
 
         const employee = await Employee.findByIdAndUpdate(
-            id,
-            updateData,
-            { new: true, runValidators: true }
+            req.params.id,
+            { $set: req.body },
+            { new: true }
         )
-            .populate('department')
-            .populate('reportingManager', 'firstName lastName');
+            .select('-password')
+            .populate('department', 'name')
+            .populate('reportingManager', 'firstName lastName email');
 
         if (!employee) {
-            return res.status(404).json({ message: 'Employee not found' });
+            return notFoundResponse(res, 'Employee not found');
         }
 
-        res.json(employee);
+        return successResponse(res, employee, 'Employee updated successfully');
     } catch (error) {
-        console.error('Error updating employee:', error);
-        res.status(500).json({ message: error.message });
+        if (error instanceof mongoose.Error.CastError) {
+            return notFoundResponse(res, 'Invalid employee ID');
+        }
+        return errorResponse(res, 'Error updating employee');
     }
 });
 
-router.delete('/:id', authenticateToken, requireAdmin, employeeController.deleteEmployee);
+// Delete employee
+router.delete('/:id', authenticateToken, isAdmin, async (req, res) => {
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-// Change password (for employees)
+    try {
+        const employee = await Employee.findById(req.params.id).session(session);
+        if (!employee) {
+            await session.abortTransaction();
+            return notFoundResponse(res, 'Employee not found');
+        }
+
+        // Update reporting employees to remove this manager
+        await Employee.updateMany(
+            { reportingManager: employee._id },
+            { $set: { reportingManager: null } },
+            { session }
+        );
+
+        // Delete the employee
+        await Employee.findByIdAndDelete(employee._id, { session });
+
+        // Delete associated user if exists
+        if (employee.userId) {
+            await User.findByIdAndDelete(employee.userId, { session });
+        }
+
+        await session.commitTransaction();
+        return successResponse(res, null, 'Employee deleted successfully');
+    } catch (error) {
+        await session.abortTransaction();
+        if (error instanceof mongoose.Error.CastError) {
+            return notFoundResponse(res, 'Invalid employee ID');
+        }
+        return errorResponse(res, 'Error deleting employee');
+    } finally {
+        session.endSession();
+    }
+});
+
+// Change password
 router.post('/change-password', authenticateToken, async (req, res) => {
     try {
         const { currentPassword, newPassword } = req.body;
-        const userId = req.user._id;
 
-        const user = await User.findById(userId);
-        if (!user) {
-            return res.status(404).json({ message: 'User not found' });
+        if (!currentPassword || !newPassword) {
+            return validationErrorResponse(res, 'Both current and new passwords are required');
         }
 
-        // Verify current password
+        const user = await User.findById(req.user.userId);
+        if (!user) {
+            return notFoundResponse(res, 'User not found');
+        }
+
         const isMatch = await bcrypt.compare(currentPassword, user.password);
         if (!isMatch) {
-            return res.status(400).json({ message: 'Current password is incorrect' });
+            return errorResponse(res, 'Current password is incorrect', 400);
         }
 
-        // Update password
         user.password = newPassword;
         await user.save();
 
-        res.json({ message: 'Password updated successfully' });
+        return successResponse(res, null, 'Password updated successfully');
     } catch (error) {
-        res.status(500).json({ message: error.message });
+        return errorResponse(res, 'Error changing password');
     }
 });
 

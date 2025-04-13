@@ -3,6 +3,8 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const dotenv = require('dotenv');
 const morgan = require('morgan');
+const helmet = require('helmet');
+const { errorResponse, unauthorizedResponse } = require('./utils/apiResponse');
 
 // Load environment variables
 dotenv.config();
@@ -10,14 +12,28 @@ dotenv.config();
 // Create Express app
 const app = express();
 
+// Security headers
+app.use(helmet());
+app.use(helmet.contentSecurityPolicy({
+    directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", "'unsafe-inline'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", "data:", "https:"],
+        connectSrc: ["'self'", process.env.FRONTEND_URL || 'http://localhost:5173']
+    }
+}));
+
 // Middleware
 app.use(cors({
-    origin: [
+    origin: process.env.FRONTEND_URL ? [process.env.FRONTEND_URL] : [
+        'http://localhost:5173',
         'https://quantum-sphere.netlify.app',
-        'https://quantum-sphere.netlify.app/',
-        'http://localhost:5173'
+        'https://quantumsphere-frontend.onrender.com'
     ],
-    credentials: true
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
 }));
 app.use(express.json());
 app.use(morgan('dev'));
@@ -29,8 +45,29 @@ app.use((req, res, next) => {
 });
 
 // Health check endpoint (no auth required)
-app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok' });
+app.get('/api/health', async (req, res) => {
+    try {
+        const dbStatus = mongoose.connection.readyState === 1 ? 'connected' : 'disconnected';
+        const memoryUsage = process.memoryUsage();
+
+        res.json({
+            status: 'ok',
+            database: dbStatus,
+            timestamp: new Date().toISOString(),
+            uptime: process.uptime(),
+            memory: {
+                heapUsed: Math.round(memoryUsage.heapUsed / 1024 / 1024) + 'MB',
+                heapTotal: Math.round(memoryUsage.heapTotal / 1024 / 1024) + 'MB',
+                rss: Math.round(memoryUsage.rss / 1024 / 1024) + 'MB'
+            }
+        });
+    } catch (error) {
+        res.status(503).json({
+            status: 'error',
+            message: 'Service unavailable',
+            error: error.message
+        });
+    }
 });
 
 // Connect to MongoDB with improved error handling
@@ -38,8 +75,11 @@ mongoose.connect(process.env.MONGODB_URI, {
     useNewUrlParser: true,
     useUnifiedTopology: true,
     retryWrites: true,
-    serverSelectionTimeoutMS: 5000, // 5 second timeout
-    heartbeatFrequencyMS: 2000 // Check server every 2 seconds
+    retryReads: true,
+    serverSelectionTimeoutMS: 30000, // 30 seconds
+    heartbeatFrequencyMS: 2000,
+    maxPoolSize: 10,
+    minPoolSize: 5
 })
     .then(() => {
         console.log('Connected to MongoDB Atlas successfully');
@@ -48,7 +88,11 @@ mongoose.connect(process.env.MONGODB_URI, {
     .catch(err => {
         console.error('MongoDB connection error:', err);
         console.error('Connection string:', process.env.MONGODB_URI.replace(/:([^:@]{8})[^:@]*@/, ':****@'));
-        process.exit(1);
+        // Attempt to reconnect
+        setTimeout(() => {
+            console.log('Attempting to reconnect to MongoDB...');
+            process.exit(1);
+        }, 5000);
     });
 
 // Check JWT secret
@@ -98,16 +142,21 @@ app.use((req, res) => {
 
 // Error handling middleware
 app.use((err, req, res, next) => {
-    console.error('Server error:', err);
+    console.error('Server Error:', err);
+
     if (err.name === 'UnauthorizedError') {
-        return res.status(401).json({
-            message: 'Please sign in to continue'
-        });
+        return unauthorizedResponse(res, 'Please sign in to continue');
     }
-    res.status(500).json({
-        message: 'Internal server error',
-        error: process.env.NODE_ENV === 'development' ? err.message : undefined
-    });
+
+    if (err.name === 'MongoError' || err.name === 'MongoServerError') {
+        return errorResponse(res, 'Database service unavailable', 503);
+    }
+
+    if (err.name === 'ValidationError') {
+        return errorResponse(res, 'Validation error', 400, err.errors);
+    }
+
+    return errorResponse(res, 'Internal server error', 500);
 });
 
 // Start server

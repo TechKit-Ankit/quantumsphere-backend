@@ -1,30 +1,36 @@
 const jwt = require('jsonwebtoken');
+const { unauthorizedResponse } = require('../utils/apiResponse');
 const Employee = require('../models/Employee');
 
 const authenticateToken = (req, res, next) => {
-    try {
-        const authHeader = req.header('Authorization');
-        const token = authHeader && authHeader.split(' ')[1];
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
 
-        if (!token) {
-            console.log('No token provided in request');
-            return res.status(401).json({ message: 'No token, authorization denied' });
-        }
-
-        try {
-            const decoded = jwt.verify(token, process.env.JWT_SECRET);
-            // Store the full decoded object in req.user
-            req.user = decoded;
-            console.log('Token verified for user:', decoded.userId);
-            next();
-        } catch (jwtError) {
-            console.error('JWT verification failed:', jwtError.message);
-            return res.status(401).json({ message: 'Token is invalid or expired' });
-        }
-    } catch (error) {
-        console.error('Auth middleware error:', error);
-        res.status(500).json({ message: 'Internal server error during authentication' });
+    if (!token) {
+        return unauthorizedResponse(res, 'Access token is required');
     }
+
+    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+        if (err) {
+            return unauthorizedResponse(res, 'Invalid or expired token');
+        }
+        req.user = user;
+        next();
+    });
+};
+
+const isAdmin = (req, res, next) => {
+    if (!req.user || req.user.role !== 'admin') {
+        return unauthorizedResponse(res, 'Admin access required');
+    }
+    next();
+};
+
+const isManager = (req, res, next) => {
+    if (!req.user || req.user.role !== 'manager') {
+        return unauthorizedResponse(res, 'Manager access required');
+    }
+    next();
 };
 
 const requireAdmin = async (req, res, next) => {
@@ -47,4 +53,9 @@ const requireAdmin = async (req, res, next) => {
     }
 };
 
-module.exports = { authenticateToken, requireAdmin };
+module.exports = {
+    authenticateToken,
+    isAdmin,
+    isManager,
+    requireAdmin
+};
