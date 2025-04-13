@@ -3,8 +3,10 @@ const router = express.Router();
 const { body, validationResult } = require('express-validator');
 const Leave = require('../models/Leave');
 const Employee = require('../models/Employee');
+const User = require('../models/User');
 const { authenticateToken } = require('../middleware/auth');
 const { successResponse, errorResponse, notFoundResponse, validationErrorResponse, unauthorizedResponse } = require('../utils/apiResponse');
+const mongoose = require('mongoose');
 
 // Validation middleware
 const leaveValidation = [
@@ -32,51 +34,63 @@ const validate = (req, res, next) => {
 // Use JWT auth
 router.use(authenticateToken);
 
-// Get all leaves (filtered by query params)
+// Get all leaves (filtered by query params AND company)
 router.get('/', async (req, res) => {
     try {
-        const query = {};
+        // Get user's company ID
+        const companyId = await getCompanyIdFromUser(req.user.userId);
+        if (!companyId) {
+            return errorResponse(res, 'Could not determine user\'s company', 400);
+        }
 
-        // Filter by multiple employee IDs if provided
+        // Start with base query filtering by company employees
+        const companyEmployeeIds = await Employee.find({ company: companyId }).select('_id').lean();
+        const employeeIds = companyEmployeeIds.map(emp => emp._id);
+        const query = { employee: { $in: employeeIds } };
+
+        // Apply optional filters from query params
         if (req.query.employeeIds) {
-            const employeeIds = req.query.employeeIds.split(',');
-            query.employee = { $in: employeeIds };
+            // Ensure requested employeeIds are within the user's company
+            const requestedIds = req.query.employeeIds.split(',')
+                .filter(id => employeeIds.some(empId => empId.toString() === id));
+            query.employee = { $in: requestedIds };
+        } else if (req.query.employee) {
+            // Ensure requested employee is within the user's company
+            if (employeeIds.some(empId => empId.toString() === req.query.employee)) {
+                query.employee = req.query.employee;
+            } else {
+                // Requested employee not in company, return empty
+                return successResponse(res, [], 'Employee not found in your company');
+            }
+        } else if (req.query.view === 'team-leaves' && req.user.role !== 'admin') {
+            // For team view (non-admin), find manager's direct reports within the company
+            const managerEmployee = await Employee.findOne({ userId: req.user.userId, company: companyId }).select('_id').lean();
+            if (managerEmployee) {
+                const reportingEmployees = await Employee.find({ reportingManager: managerEmployee._id, company: companyId }).select('_id').lean();
+                const reportingIds = reportingEmployees.map(emp => emp._id);
+                // Ensure we only query reports, even if they have no leaves
+                query.employee = { $in: reportingIds.length > 0 ? reportingIds : [new mongoose.Types.ObjectId()] }; // Query for valid IDs or a dummy ID
+            } else {
+                // Manager not found in the company?
+                return successResponse(res, [], 'Manager profile not found in your company');
+            }
+        } else if (req.user.role !== 'admin') {
+            // Default for non-admin, non-team view: only own leaves
+            let selfEmployeeId = null;
+            if (req.user.employeeId) {
+                selfEmployeeId = employeeIds.find(empId => empId.toString() === req.user.employeeId);
+            }
+            if (!selfEmployeeId) {
+                const selfEmployee = await Employee.findOne({ userId: req.user.userId, company: companyId }).select('_id').lean();
+                selfEmployeeId = selfEmployee ? selfEmployee._id : new mongoose.Types.ObjectId();
+            }
+            query.employee = selfEmployeeId;
         }
-        // Filter by single employee ID if provided
-        else if (req.query.employee) {
-            query.employee = req.query.employee;
-        }
+        // If admin, the base query { employee: { $in: employeeIds } } already covers all company employees
 
         // Filter by status if provided
         if (req.query.status) {
             query.status = req.query.status;
-        }
-
-        // If not admin or HR, limit to the current user's leaves
-        if (req.user.role !== 'admin' && req.user.role !== 'hr') {
-            // Get the current employee to check if they have reporting employees
-            const employee = await Employee.findOne({ userId: req.user.userId });
-
-            if (!employee) {
-                return notFoundResponse(res, 'Employee not found');
-            }
-
-            // If no specific query was provided and the endpoint is for 'team-leaves',
-            // fetch leaves for employees reporting to this manager
-            if (!req.query.employeeIds && !req.query.employee && req.query.view === 'team-leaves') {
-                const reportingEmployees = await Employee.find({ reportingManager: employee._id });
-                const reportingEmployeeIds = reportingEmployees.map(emp => emp._id);
-
-                if (reportingEmployeeIds.length > 0) {
-                    query.employee = { $in: reportingEmployeeIds };
-                } else {
-                    // No reporting employees, return empty array
-                    return successResponse(res, [], 'No reporting employees found');
-                }
-            } else if (!query.employee) {
-                // If not viewing team leaves and no specific employee filter, show only current user's leaves
-                query.employee = employee._id;
-            }
         }
 
         const leaves = await Leave.find(query)
@@ -84,8 +98,9 @@ router.get('/', async (req, res) => {
             .populate('managerApproval.approvedBy', 'firstName lastName')
             .sort({ createdAt: -1 });
 
-        return successResponse(res, leaves, 'Leaves retrieved successfully');
+        return successResponse(res, leaves, 'Leaves retrieved successfully for company');
     } catch (error) {
+        console.error("Error fetching leaves for company:", error);
         return errorResponse(res, 'Error fetching leaves');
     }
 });
@@ -93,13 +108,24 @@ router.get('/', async (req, res) => {
 // Get leaves for a specific employee
 router.get('/employee/:employeeId', async (req, res) => {
     try {
+        const actingUserCompanyId = await getCompanyIdFromUser(req.user.userId);
+        if (!actingUserCompanyId) {
+            return errorResponse(res, 'Could not determine your company', 400);
+        }
+        const targetEmployee = await Employee.findById(req.params.employeeId).select('company').lean();
+        if (!targetEmployee) {
+            return notFoundResponse(res, 'Target employee not found');
+        }
+        if (targetEmployee.company.toString() !== actingUserCompanyId.toString()) {
+            return unauthorizedResponse(res, 'Cannot view leaves for employees outside your company');
+        }
         const leaves = await Leave.find({ employee: req.params.employeeId })
             .populate('employee', 'firstName lastName')
             .populate('managerApproval.approvedBy', 'firstName lastName')
             .sort({ createdAt: -1 });
-
         return successResponse(res, leaves, 'Employee leaves retrieved successfully');
     } catch (error) {
+        console.error("Error fetching specific employee leaves:", error);
         return errorResponse(res, 'Error fetching employee leaves');
     }
 });
@@ -107,31 +133,32 @@ router.get('/employee/:employeeId', async (req, res) => {
 // Create a new leave request
 router.post('/', leaveValidation, validate, async (req, res) => {
     try {
-        // Check if employee is directly specified in the request
+        const actingUserCompanyId = await getCompanyIdFromUser(req.user.userId);
+        if (!actingUserCompanyId) {
+            return errorResponse(res, 'Could not determine your company', 400);
+        }
+        let employeeIdToUse;
         if (req.body.employee) {
-            const leave = new Leave({
-                employee: req.body.employee,
-                startDate: req.body.startDate,
-                endDate: req.body.endDate,
-                type: req.body.type,
-                reason: req.body.reason,
-                comments: req.body.comments,
-                status: 'pending'
-            });
-
-            await leave.save();
-            return successResponse(res, leave, 'Leave request created successfully', 201);
+            const targetEmployee = await Employee.findById(req.body.employee).select('company').lean();
+            if (!targetEmployee) {
+                return notFoundResponse(res, 'Specified employee not found');
+            }
+            if (targetEmployee.company.toString() !== actingUserCompanyId.toString()) {
+                return unauthorizedResponse(res, 'Cannot create leave for employees outside your company');
+            }
+            employeeIdToUse = req.body.employee;
+        } else {
+            const selfEmployee = await Employee.findOne({ userId: req.user.userId }).select('_id company').lean();
+            if (!selfEmployee) {
+                return notFoundResponse(res, 'Your employee profile not found');
+            }
+            if (selfEmployee.company.toString() !== actingUserCompanyId.toString()) {
+                return unauthorizedResponse(res, 'Cannot create leave, company mismatch');
+            }
+            employeeIdToUse = selfEmployee._id;
         }
-
-        // Otherwise, find the employee based on the logged-in user
-        const employee = await Employee.findOne({ userId: req.user.userId });
-
-        if (!employee) {
-            return notFoundResponse(res, 'Employee not found');
-        }
-
         const leave = new Leave({
-            employee: employee._id,
+            employee: employeeIdToUse,
             startDate: req.body.startDate,
             endDate: req.body.endDate,
             type: req.body.type,
@@ -139,10 +166,11 @@ router.post('/', leaveValidation, validate, async (req, res) => {
             comments: req.body.comments,
             status: 'pending'
         });
-
         await leave.save();
-        return successResponse(res, leave, 'Leave request created successfully', 201);
+        const populatedLeave = await Leave.findById(leave._id).populate('employee', 'firstName lastName');
+        return successResponse(res, populatedLeave, 'Leave request created successfully', 201);
     } catch (error) {
+        console.error("Error creating leave:", error);
         return errorResponse(res, 'Error creating leave request');
     }
 });
@@ -150,49 +178,38 @@ router.post('/', leaveValidation, validate, async (req, res) => {
 // Update leave status
 router.patch('/:id/status', leaveStatusValidation, validate, async (req, res) => {
     try {
+        const actingUserCompanyId = await getCompanyIdFromUser(req.user.userId);
+        if (!actingUserCompanyId) {
+            return errorResponse(res, 'Could not determine your company', 400);
+        }
         const { status, comments } = req.body;
-        const leave = await Leave.findById(req.params.id);
-
+        const leave = await Leave.findById(req.params.id).populate({
+            path: 'employee',
+            select: 'company'
+        });
         if (!leave) {
             return notFoundResponse(res, 'Leave request not found');
         }
-
-        // Ensure only admin can use this endpoint
+        if (!leave.employee || leave.employee.company.toString() !== actingUserCompanyId.toString()) {
+            return unauthorizedResponse(res, 'Cannot modify leaves outside your company');
+        }
         if (req.user.role !== 'admin') {
             return unauthorizedResponse(res, 'Admin access required to update leave status');
         }
-
-        // Prevent updating already processed leaves if desired (optional check)
-        // if (leave.status !== 'pending') {
-        //    return errorResponse(res, 'Leave request already processed', 400);
-        // }
-
         const originalStatus = leave.status;
-
-        // Update only the main status and related fields
         leave.status = status;
-        // Optionally add a field to track who updated the status if needed
-        // leave.statusUpdatedBy = req.user.userId; 
-        leave.statusUpdateDate = new Date(); // Consider a dedicated field if needed
-        leave.statusComments = comments; // Consider a dedicated field if needed
-
-        // DO NOT MODIFY managerApproval here - this endpoint is for overall status
-
+        leave.statusUpdateDate = new Date();
+        leave.statusComments = comments;
         await leave.save();
-
-        // Update employee leave balance based on the main status change
         const isNewlyApproved = originalStatus !== 'approved' && status === 'approved';
         const isApprovalRevoked = originalStatus === 'approved' && (status === 'rejected' || status === 'canceled');
-
         if (isNewlyApproved) {
             await updateEmployeeLeaveBalance(leave);
         } else if (isApprovalRevoked) {
             await restoreLeaveBalance(leave);
         }
-
         return successResponse(res, leave, 'Leave status updated successfully');
     } catch (error) {
-        // Log the detailed error
         console.error(`Error updating leave status for ${req.params.id}:`, error);
         return errorResponse(res, 'Error updating leave status', 500, error.message);
     }
@@ -201,20 +218,27 @@ router.patch('/:id/status', leaveStatusValidation, validate, async (req, res) =>
 // Delete leave request
 router.delete('/:id', async (req, res) => {
     try {
-        const leave = await Leave.findById(req.params.id);
-
+        const actingUserCompanyId = await getCompanyIdFromUser(req.user.userId);
+        if (!actingUserCompanyId) {
+            return errorResponse(res, 'Could not determine your company', 400);
+        }
+        const leave = await Leave.findById(req.params.id).populate({
+            path: 'employee',
+            select: 'company userId'
+        });
         if (!leave) {
             return notFoundResponse(res, 'Leave request not found');
         }
-
-        // Check if the leave was approved - need to restore leave balance
+        if (!leave.employee || leave.employee.company.toString() !== actingUserCompanyId.toString()) {
+            return unauthorizedResponse(res, 'Cannot delete leaves outside your company');
+        }
         if (leave.status === 'approved') {
             await restoreLeaveBalance(leave);
         }
-
         await Leave.deleteOne({ _id: req.params.id });
         return successResponse(res, null, 'Leave request deleted successfully');
     } catch (error) {
+        console.error(`Error deleting leave ${req.params.id}:`, error);
         return errorResponse(res, 'Error deleting leave request');
     }
 });
@@ -222,49 +246,40 @@ router.delete('/:id', async (req, res) => {
 // Update leave request
 router.put('/:id', leaveValidation, validate, async (req, res) => {
     try {
+        const actingUserCompanyId = await getCompanyIdFromUser(req.user.userId);
+        if (!actingUserCompanyId) {
+            return errorResponse(res, 'Could not determine your company', 400);
+        }
         const { id } = req.params;
         const updateData = req.body;
-
-        // Find the leave by ID
-        const leave = await Leave.findById(id);
-
+        const leave = await Leave.findById(id).populate({
+            path: 'employee',
+            select: 'company'
+        });
         if (!leave) {
             return notFoundResponse(res, 'Leave request not found');
         }
-
-        // Store the original status before any updates
+        if (!leave.employee || leave.employee.company.toString() !== actingUserCompanyId.toString()) {
+            return unauthorizedResponse(res, 'Cannot modify leaves outside your company');
+        }
         const originalStatus = leave.status;
-
-        // Update the fields
         Object.assign(leave, updateData);
-
-        // --- If manager just approved, also set main status to approved ---
         if (updateData.managerApproval?.status === 'approved') {
             console.log(`Manager approved leave ${id}, setting main status to approved.`);
             leave.status = 'approved';
         }
-        // --- End NEW ---
-
-        // Save the updated leave
         await leave.save();
-
-        // --- Check approval status AFTER potential update by manager ---
         const isNewlyApproved = originalStatus !== 'approved' && leave.status === 'approved';
         const isApprovalRevoked = originalStatus === 'approved' &&
             (leave.status === 'rejected' || leave.status === 'canceled');
-        // --- End Check ---
-
-        // If the leave was just approved, update the employee's leave balance
         if (isNewlyApproved) {
             await updateEmployeeLeaveBalance(leave);
-        }
-        // If approval was revoked, restore the leave balance
-        else if (isApprovalRevoked) {
+        } else if (isApprovalRevoked) {
             await restoreLeaveBalance(leave);
         }
-
         return successResponse(res, leave, 'Leave request updated successfully');
     } catch (error) {
+        console.error(`Error updating leave ${req.params.id}:`, error);
         return errorResponse(res, 'Error updating leave request');
     }
 });
@@ -274,20 +289,14 @@ async function updateEmployeeLeaveBalance(leave) {
     try {
         const employee = await Employee.findById(leave.employee);
         if (!employee || !employee.leaveBalance) return;
-
-        // Calculate number of days
         const startDate = new Date(leave.startDate);
         const endDate = new Date(leave.endDate);
         const diffTime = Math.abs(endDate - startDate);
-        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1; // +1 to include both start and end dates
-
-        // Update leave balance
+        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
         employee.leaveBalance.used += diffDays;
         employee.leaveBalance.remaining = employee.leaveBalance.total - employee.leaveBalance.used;
-
         await employee.save();
     } catch (error) {
-        // Log error but allow process to continue
         console.error(`Error updating leave balance for employee ${leave.employee}: ${error.message}`);
     }
 }
@@ -297,22 +306,25 @@ async function restoreLeaveBalance(leave) {
     try {
         const employee = await Employee.findById(leave.employee);
         if (!employee || !employee.leaveBalance) return;
-
-        // Calculate number of days
         const startDate = new Date(leave.startDate);
         const endDate = new Date(leave.endDate);
         const diffTime = Math.abs(endDate - startDate);
-        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1; // +1 to include both start and end dates
-
-        // Restore leave balance
+        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
         employee.leaveBalance.used = Math.max(0, employee.leaveBalance.used - diffDays);
         employee.leaveBalance.remaining = employee.leaveBalance.total - employee.leaveBalance.used;
-
         await employee.save();
     } catch (error) {
-        // Log error but allow process to continue
         console.error(`Error restoring leave balance for employee ${leave.employee}: ${error.message}`);
     }
 }
+
+// --- Helper to get company ID from user ID (Copied from dashboardController) ---
+async function getCompanyIdFromUser(userId) {
+    const user = await User.findById(userId).select('company').lean();
+    if (user?.company) return user.company;
+    const employee = await Employee.findOne({ userId: userId }).select('company').lean();
+    return employee?.company;
+}
+// --- End Helper ---
 
 module.exports = router;

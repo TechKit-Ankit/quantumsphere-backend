@@ -1,13 +1,33 @@
 const Employee = require('../models/Employee');
 const Leave = require('../models/Leave');
+const User = require('../models/User');
+const { errorResponse } = require('../utils/apiResponse');
+
+// Helper to get company ID from user ID
+async function getCompanyIdFromUser(userId) {
+    const user = await User.findById(userId).select('company').lean();
+    if (user?.company) return user.company;
+    // Fallback: Check Employee record if User doesn't have company directly
+    const employee = await Employee.findOne({ userId: userId }).select('company').lean();
+    return employee?.company;
+}
 
 exports.getDashboardStats = async (req, res) => {
     try {
-        const query = req.user.role === 'admin' ? {} : { userId: req.user.userId };
+        const companyId = await getCompanyIdFromUser(req.user.userId);
+        if (!companyId) {
+            return errorResponse(res, 'Could not determine user\'s company', 400);
+        }
 
-        const totalEmployees = await Employee.countDocuments();
-        const activeEmployees = await Employee.countDocuments({ status: 'active' });
-        const pendingLeaves = await Leave.countDocuments({ status: 'pending' });
+        // Use companyId in queries
+        const totalEmployees = await Employee.countDocuments({ company: companyId });
+        const activeEmployees = await Employee.countDocuments({ company: companyId, status: 'active' });
+        // Note: Assuming Leave model doesn't have a direct company field.
+        // We need to get employees of the company first, then filter leaves by those employees.
+        const companyEmployeeIds = await Employee.find({ company: companyId }).select('_id').lean();
+        const employeeIds = companyEmployeeIds.map(emp => emp._id);
+
+        const pendingLeaves = await Leave.countDocuments({ employee: { $in: employeeIds }, status: 'pending' });
 
         res.json({
             totalEmployees,
@@ -22,9 +42,16 @@ exports.getDashboardStats = async (req, res) => {
 
 exports.getRecentActivities = async (req, res) => {
     try {
-        const query = req.user.role === 'admin' ? {} : { userId: req.user.userId };
+        const companyId = await getCompanyIdFromUser(req.user.userId);
+        if (!companyId) {
+            return errorResponse(res, 'Could not determine user\'s company', 400);
+        }
 
-        const activities = await Leave.find(query)
+        // Filter leaves by employees belonging to the company
+        const companyEmployeeIds = await Employee.find({ company: companyId }).select('_id').lean();
+        const employeeIds = companyEmployeeIds.map(emp => emp._id);
+
+        const activities = await Leave.find({ employee: { $in: employeeIds } })
             .sort({ createdAt: -1 })
             .limit(5)
             .populate('employee', 'firstName lastName');
@@ -38,9 +65,16 @@ exports.getRecentActivities = async (req, res) => {
 
 exports.getRecentLeaves = async (req, res) => {
     try {
-        const query = req.user.role === 'admin' ? {} : { userId: req.user.userId };
+        const companyId = await getCompanyIdFromUser(req.user.userId);
+        if (!companyId) {
+            return errorResponse(res, 'Could not determine user\'s company', 400);
+        }
 
-        const leaves = await Leave.find(query)
+        // Filter leaves by employees belonging to the company
+        const companyEmployeeIds = await Employee.find({ company: companyId }).select('_id').lean();
+        const employeeIds = companyEmployeeIds.map(emp => emp._id);
+
+        const leaves = await Leave.find({ employee: { $in: employeeIds } })
             .sort({ startDate: -1 })
             .limit(5)
             .populate('employee', 'firstName lastName');
